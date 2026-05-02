@@ -1,0 +1,27 @@
+name: 禁漫天堂每日自动签到
+
+on:
+  schedule:
+    - cron: '0 23 * * *'
+  workflow_dispatch:
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install axios crypto-js
+
+      - name: Run daily checkin
+        env:
+          JM_ACCOUNT: ${{ secrets.JM_ACCOUNT }}
+          JM_PASSWORD: ${{ secrets.JM_PASSWORD }}
+        run: node scripts/daily-checkin.js
