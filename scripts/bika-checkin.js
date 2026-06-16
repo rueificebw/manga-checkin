@@ -171,13 +171,18 @@ async function checkin(token) {
     return true;
   }
 
-  const msg = data?.message || data?.errorMsg || JSON.stringify(data);
+  const msg = data?.message || data?.errorMsg || "";
+  if (data?.code === 200 && msg.toLowerCase() === "success") {
+    console.log("[bika] 签到成功");
+    return true;
+  }
+
   if (msg.includes("already") || msg.includes("已签到")) {
     console.log("[bika] 今天已经签到过了");
     return true;
   }
 
-  throw new Error(`签到失败: ${msg}`);
+  throw new Error(`签到失败: ${msg || JSON.stringify(data)}`);
 }
 
 async function main() {
