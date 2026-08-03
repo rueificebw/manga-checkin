@@ -72,14 +72,19 @@ async function bikaRequest({ apiBase, method, url, body, authorization }) {
   const fullUrl = url.startsWith("http") ? url : `${apiBase}${url}`;
   const headers = buildHeaders({ method, url: fullUrl, authorization });
 
-  const response = await axios({
+  // 非 GET 请求一律携带 JSON 请求体（缺失时默认空对象 {}），
+  // 哔咔 punch-in 等接口必须发送空对象 {}，否则服务端返回 res.status:"fail"
+  const requestConfig = {
     method,
     url: fullUrl,
     headers,
-    data: body ?? {},
     timeout: 15000,
     validateStatus: () => true,
-  });
+  };
+  const requestBody = body !== undefined && body !== null ? body : {};
+  requestConfig.data = requestBody;
+
+  const response = await axios(requestConfig);
 
   const data = response.data;
 
@@ -155,34 +160,81 @@ async function getUserProfile(token) {
 
 async function checkin(token) {
   console.log("[bika] 正在签到...");
+
   const data = await tryWithFallback((apiBase) =>
     bikaRequest({
       apiBase,
       method: "POST",
       url: "users/punch-in",
+      // 哔咔 punch-in 接口必须携带空 JSON 对象 {} 请求体，
+      // 否则服务端返回 data.res.status:"fail"
       body: {},
       authorization: token,
     })
   );
 
+  console.log("[bika] 签到 API 响应:", JSON.stringify(data));
+
   const status = data?.data?.res?.status;
-  if (data?.code === 200 && status && status !== "fail") {
-    console.log("[bika] 签到成功");
+  if (status === "ok") {
+    const punchInLastDay = data?.data?.res?.punchInLastDay ?? "?";
+    console.log(`[bika] 签到成功 (最近签到: ${punchInLastDay})`);
     return true;
   }
 
+  // status 为 "fail" 时可能是"今日已签到"（幂等），也可能是真实失败，
+  // 通过 users/profile 的 isPunched 字段二次确认
+  if (status === "fail") {
+    const profile = await tryWithFallback((apiBase) =>
+      bikaRequest({
+        apiBase,
+        method: "GET",
+        url: "users/profile",
+        authorization: token,
+      })
+    );
+    if (profile?.data?.user?.isPunched === true) {
+      console.log("[bika] 今天已经签到过了");
+      return true;
+    }
+    throw new Error(`签到失败: ${JSON.stringify(data)}`);
+  }
+
+  // 兜底：兼容其他成功格式（"already" 等提示）
   const msg = data?.message || data?.errorMsg || "";
-  if (data?.code === 200 && msg.toLowerCase() === "success") {
-    console.log("[bika] 签到成功");
-    return true;
-  }
-
-  if (msg.includes("already") || msg.includes("已签到")) {
+  if (msg.includes("already") || msg.includes("已签到") || msg.includes("已经")) {
     console.log("[bika] 今天已经签到过了");
     return true;
   }
 
-  throw new Error(`签到失败: ${msg || JSON.stringify(data)}`);
+  // 注意：data.message 通常是 "success"（HTTP 层消息），不能作为失败原因，
+  // 因此直接输出完整响应便于排查
+  throw new Error(`签到失败: ${JSON.stringify(data)}`);
+}
+
+async function verifyCheckinStatus(token) {
+  console.log("[bika] 正在验证签到状态...");
+  const data = await tryWithFallback((apiBase) =>
+    bikaRequest({
+      apiBase,
+      method: "GET",
+      url: "users/profile",
+      authorization: token,
+    })
+  );
+
+  const isPunched = data?.data?.user?.isPunched;
+  if (isPunched === true) {
+    console.log("[bika] 签到状态验证通过: 今日已签到 ✓");
+    return true;
+  }
+  if (isPunched === false) {
+    console.warn("[bika] 签到状态验证失败: 今日未签到 ✗");
+    return false;
+  }
+  // 部分 API 版本 profile 不返回 isPunched 字段，此时不阻塞任务
+  console.warn("[bika] profile 未返回 isPunched 字段，跳过状态验证");
+  return true;
 }
 
 async function main() {
@@ -198,6 +250,11 @@ async function main() {
     const token = await login(account, password);
     await getUserProfile(token);
     await checkin(token);
+    const verified = await verifyCheckinStatus(token);
+    if (!verified) {
+      console.error("[bika] 签到验证失败: users/profile 显示 isPunched 不为 true，实际可能未签到");
+      process.exit(1);
+    }
     console.log("[bika] 每日签到任务完成");
   } catch (error) {
     console.error("[bika] 签到任务失败:", error.message || error);
