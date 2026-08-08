@@ -1,15 +1,17 @@
 import axios from "axios";
 import CryptoJS from "crypto-js";
 
-const JM_VERSION = "2.0.13";
+const JM_VERSION = "2.0.20";
 const JM_SECRET = "185Hcomic3PAPP7R";
+const SETTING_AES_SEEDS = [JM_SECRET, "18comicAPPContent"];
+const HOSTCFG_AES_SEED = "diosfjckwpqpdfjkvnqQjsik";
 
-const BASE_URLS = [
-  "https://www.cdnsha.org",
-  "https://www.cdnbea.cc",
-  "https://www.cdnbea.net",
-  "https://www.cdn-mspjmapiproxy.xyz",
+// 域名会轮换，不能硬编码：先从线路配置文件拉取当前可用域名池，再逐个探测
+const HOST_CONFIG_URLS = [
+  "https://rup4a04-c02.tos-cn-hongkong.bytepluses.com/newsvr-2025.txt",
+  "https://rup4a04-c01.tos-ap-southeast-1.bytepluses.com/newsvr-2025.txt",
 ];
+const FALLBACK_API_BASES = ["https://www.cdnhjk.net"];
 
 function nowTs() {
   return String(Date.now());
@@ -111,18 +113,20 @@ async function decodeValue(value, ts) {
       const rawData = dataField.trim();
       const normalizedB64 = normalizeBase64(rawData);
       if (normalizedB64) {
-        try {
-          const key = md5Hex(`${ts}${JM_SECRET}`);
-          const decrypted = aesEcbDecrypt(normalizedB64, key);
-          if (decrypted.trim()) {
-            try {
-              return JSON.parse(decrypted.trim());
-            } catch {
-              return decrypted.trim();
+        for (const seed of SETTING_AES_SEEDS) {
+          try {
+            const key = md5Hex(`${ts}${seed}`);
+            const decrypted = aesEcbDecrypt(normalizedB64, key);
+            if (decrypted.trim()) {
+              try {
+                return JSON.parse(decrypted.trim());
+              } catch {
+                return decrypted.trim();
+              }
             }
+          } catch {
+            // try next seed
           }
-        } catch {
-          // ignore
         }
       }
       try {
@@ -203,19 +207,68 @@ async function tryRequest(config) {
   return decoded;
 }
 
-async function getFastestBaseUrl() {
-  for (const url of BASE_URLS) {
+function normalizeBaseUrl(url) {
+  const raw = String(url || "").trim().replace(/\/+$/g, "");
+  if (!raw) return "";
+  return /^https?:\/\//.test(raw) ? raw : `https://${raw}`;
+}
+
+async function loadHostPool() {
+  for (const url of HOST_CONFIG_URLS) {
     try {
-      const res = await axios.get(url, { timeout: 5000, validateStatus: () => true });
-      if (res.status < 500) {
-        console.log(`[jm] 使用 API 域名: ${url}`);
-        return url;
+      const res = await axios.get(url, { timeout: 8000, validateStatus: () => true });
+      if (res.status < 200 || res.status >= 300) continue;
+      const normalized = String(res.data || "").replace(/[^A-Za-z0-9+/=]/g, "");
+      const plain = aesEcbDecrypt(normalized, md5Hex(HOSTCFG_AES_SEED));
+      const parsed = JSON.parse(plain);
+      if (Array.isArray(parsed.Server)) {
+        return parsed.Server.map((item) => String(item || "").trim()).filter(Boolean);
       }
     } catch {
       // try next
     }
   }
-  return BASE_URLS[0];
+  return [];
+}
+
+// 用 /setting 接口验证域名是否真正提供 API（失效域名会在 /login 上返回 405）
+async function probeSetting(baseUrl) {
+  const tsSec = String(Math.floor(Date.now() / 1000));
+  const res = await axios.get(`${baseUrl}/setting?app_img_shunt=1&t=${tsSec}`, {
+    timeout: 8000,
+    validateStatus: () => true,
+    headers: {
+      token: md5Hex(`${tsSec}${JM_SECRET}`),
+      tokenparam: `${tsSec},${JM_VERSION}`,
+      "user-agent": generateUserAgent(),
+    },
+  });
+  if (res.status < 200 || res.status >= 300) return false;
+  try {
+    const decoded = await decodeResponse(res.data, tsSec);
+    return Boolean(decoded && typeof decoded === "object");
+  } catch {
+    return false;
+  }
+}
+
+async function resolveBaseUrl() {
+  const pool = await loadHostPool();
+  const candidates = [
+    ...new Set([...pool, ...FALLBACK_API_BASES].map(normalizeBaseUrl)),
+  ].filter(Boolean);
+  for (const baseUrl of candidates) {
+    try {
+      if (await probeSetting(baseUrl)) {
+        console.log(`[jm] 使用 API 域名: ${baseUrl}`);
+        return baseUrl;
+      }
+      console.log(`[jm] 域名不可用, 跳过: ${baseUrl}`);
+    } catch {
+      console.log(`[jm] 域名不可用, 跳过: ${baseUrl}`);
+    }
+  }
+  throw new Error("未找到可用的 API 域名");
 }
 
 async function login(baseUrl, account, password) {
@@ -228,8 +281,6 @@ async function login(baseUrl, account, password) {
       "content-type": "application/x-www-form-urlencoded",
     },
   });
-
-  console.log("[jm] 登录响应:", JSON.stringify(result, null, 2));
 
   // 处理两种响应结构:
   // 1. 明文: {code: 200, data: {jwttoken: "xxx", uid: "xxx"}}
@@ -311,7 +362,7 @@ async function main() {
   }
 
   try {
-    const baseUrl = await getFastestBaseUrl();
+    const baseUrl = await resolveBaseUrl();
     const { jwtToken, uid } = await login(baseUrl, account, password);
     await checkin(baseUrl, uid, jwtToken);
     console.log("[jm] 每日签到任务完成");
