@@ -5,8 +5,10 @@ const JM_VERSION = "2.0.20";
 const JM_SECRET = "185Hcomic3PAPP7R";
 const SETTING_AES_SEEDS = [JM_SECRET, "18comicAPPContent"];
 const HOSTCFG_AES_SEED = "diosfjckwpqpdfjkvnqQjsik";
+const MAKEUP_LIMIT_DEFAULT = 5;
+const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000;
 
-// 域名会轮换，不能硬编码：先从线路配置文件拉取当前可用域名池，再逐个探测
+// 线路配置地址
 const HOST_CONFIG_URLS = [
   "https://rup4a04-c02.tos-cn-hongkong.bytepluses.com/newsvr-2025.txt",
   "https://rup4a04-c01.tos-ap-southeast-1.bytepluses.com/newsvr-2025.txt",
@@ -15,6 +17,20 @@ const FALLBACK_API_BASES = ["https://www.cdnhjk.net"];
 
 function nowTs() {
   return String(Date.now());
+}
+
+// 按北京时间取当天日期
+function beijingToday() {
+  const shifted = new Date(Date.now() + BEIJING_OFFSET_MS);
+  return {
+    year: shifted.getUTCFullYear(),
+    month: shifted.getUTCMonth() + 1,
+    day: shifted.getUTCDate(),
+  };
+}
+
+function formatDateParts(year, month, day) {
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
 }
 
 function md5Hex(text) {
@@ -125,7 +141,7 @@ async function decodeValue(value, ts) {
               }
             }
           } catch {
-            // try next seed
+            // 尝试下一个密钥
           }
         }
       }
@@ -146,7 +162,7 @@ async function decodeResponse(raw, ts) {
   if (raw instanceof ArrayBuffer) {
     text = new TextDecoder("utf-8").decode(new Uint8Array(raw));
   } else if (raw && typeof raw === "object" && Buffer.isBuffer(raw)) {
-    // Node.js Buffer (axios 在 Node 环境下返回的是 Buffer 而不是 ArrayBuffer)
+    // Node.js Buffer
     text = raw.toString("utf-8");
   } else if (typeof raw === "string") {
     text = raw;
@@ -225,13 +241,13 @@ async function loadHostPool() {
         return parsed.Server.map((item) => String(item || "").trim()).filter(Boolean);
       }
     } catch {
-      // try next
+      // 尝试下一个地址
     }
   }
   return [];
 }
 
-// 用 /setting 接口验证域名是否真正提供 API（失效域名会在 /login 上返回 405）
+// 用 /setting 探测域名可用性
 async function probeSetting(baseUrl) {
   const tsSec = String(Math.floor(Date.now() / 1000));
   const res = await axios.get(`${baseUrl}/setting?app_img_shunt=1&t=${tsSec}`, {
@@ -282,9 +298,7 @@ async function login(baseUrl, account, password) {
     },
   });
 
-  // 处理两种响应结构:
-  // 1. 明文: {code: 200, data: {jwttoken: "xxx", uid: "xxx"}}
-  // 2. 解密后: {jwttoken: "xxx", uid: "xxx"}
+  // 兼容明文与解密后的响应
   const dataObj = result?.data && typeof result.data === "object" ? result.data : result;
   const jwtToken = String(dataObj?.jwttoken || "").trim();
   const uid = String(dataObj?.uid || "").trim();
@@ -305,7 +319,7 @@ async function checkin(baseUrl, uid, jwtToken) {
     method: "POST",
     url: `${baseUrl}/daily_list/filter`,
     data: new URLSearchParams({
-      data: String(new Date().getFullYear()),
+      data: String(beijingToday().year),
     }).toString(),
     headers: {
       "content-type": "application/x-www-form-urlencoded",
@@ -343,13 +357,154 @@ async function checkin(baseUrl, uid, jwtToken) {
   const msg = chkRes?.data?.msg ?? chkRes?.msg ?? "";
   console.log(`[jm] 签到结果: ${msg || "成功"}`);
 
-  if (msg === "今天已经签到过了") {
+  if (/今天已经签到过了|已經簽到過了/.test(msg)) {
     console.log("[jm] 今天已经签到过了");
   } else {
     console.log("[jm] 签到成功！");
   }
 
   return true;
+}
+
+async function fetchDailyInfo(baseUrl, uid, jwtToken) {
+  const res = await tryRequest({
+    method: "GET",
+    url: `${baseUrl}/daily`,
+    params: { user_id: uid },
+    jwt: jwtToken,
+  });
+  return res?.data ?? res;
+}
+
+// record: 按周分组的 { signed, bonus, date } 二维数组
+function collectPendingDays(record, year, month, today) {
+  const cells = Array.isArray(record) ? record.flat() : [];
+  const seen = new Set();
+  const days = [];
+
+  for (const cell of cells) {
+    if (!cell || typeof cell !== "object") continue;
+    if (cell.signed === true) continue;
+
+    const day = Number(cell.date);
+    if (!Number.isInteger(day) || day < 1 || day > 31) continue;
+    if (day >= today) continue;
+
+    const probe = new Date(Date.UTC(year, month - 1, day));
+    if (probe.getUTCMonth() !== month - 1) continue;
+
+    if (seen.has(day)) continue;
+    seen.add(day);
+    days.push(day);
+  }
+
+  return days.sort((a, b) => a - b);
+}
+
+function readMakeupUsed(daily) {
+  for (const key of [
+    "makeup_used",
+    "makeup_count",
+    "used_makeup",
+    "makeup_used_count",
+    "makeup_times",
+  ]) {
+    const value = daily?.[key];
+    if (value === undefined || value === null || value === "") continue;
+    const used = Number(value);
+    if (Number.isFinite(used) && used >= 0) return used;
+  }
+
+  const fallback = Number(process.env.JM_MAKEUP_USED ?? 0);
+  return Number.isFinite(fallback) && fallback >= 0 ? fallback : 0;
+}
+
+async function makeupCheckin(baseUrl, uid, jwtToken, dailyId, date) {
+  const res = await tryRequest({
+    method: "POST",
+    url: `${baseUrl}/daily_chk`,
+    data: new URLSearchParams({
+      user_id: uid,
+      daily_id: dailyId,
+      date,
+    }).toString(),
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    jwt: jwtToken,
+  });
+
+  return res?.data?.msg ?? res?.msg ?? "";
+}
+
+async function runMakeup(baseUrl, uid, jwtToken) {
+  console.log("[jm] 正在检查本月补签...");
+
+  let daily;
+  try {
+    daily = await fetchDailyInfo(baseUrl, uid, jwtToken);
+  } catch (error) {
+    console.error("[jm] 获取签到数据失败, 跳过补签:", error.message || error);
+    return;
+  }
+
+  if (!daily || typeof daily !== "object") {
+    console.log("[jm] 未获取到签到数据, 跳过补签");
+    return;
+  }
+
+  const dailyId = daily.daily_id;
+  if (!dailyId) {
+    console.log("[jm] 未获取到 daily_id, 跳过补签");
+    return;
+  }
+
+  const limitValue = Number(daily.makeup_limit);
+  const limit = Number.isFinite(limitValue) ? limitValue : MAKEUP_LIMIT_DEFAULT;
+  const used = readMakeupUsed(daily);
+  const remaining = Math.max(0, limit - used);
+
+  const { year, month, day: today } = beijingToday();
+  const pending = collectPendingDays(daily.record, year, month, today);
+
+  console.log(
+    `[jm] 本月未签到: ${pending.length ? pending.join(", ") : "无"}`
+  );
+  console.log(`[jm] 补签次数: 上限 ${limit}, 已用 ${used}, 剩余 ${remaining}`);
+
+  if (pending.length === 0) {
+    console.log("[jm] 无需补签");
+    return;
+  }
+
+  if (remaining <= 0) {
+    console.log("[jm] 补签次数已用完, 跳过补签");
+    return;
+  }
+
+  const targets = pending.slice(0, remaining);
+  let success = 0;
+
+  for (const day of targets) {
+    const date = formatDateParts(year, month, day);
+    try {
+      const msg = await makeupCheckin(baseUrl, uid, jwtToken, dailyId, date);
+      if (/补签成功|補簽成功/.test(msg)) {
+        success += 1;
+        console.log(`[jm] 补签 ${date} 成功: ${msg}`);
+      } else {
+        console.log(`[jm] 补签 ${date} 失败: ${msg || "未知原因"}, 停止补签`);
+        break;
+      }
+    } catch (error) {
+      console.log(
+        `[jm] 补签 ${date} 失败: ${error.message || error}, 停止补签`
+      );
+      break;
+    }
+  }
+
+  console.log(`[jm] 补签完成: 成功 ${success}/${targets.length}`);
 }
 
 async function main() {
@@ -364,7 +519,14 @@ async function main() {
   try {
     const baseUrl = await resolveBaseUrl();
     const { jwtToken, uid } = await login(baseUrl, account, password);
-    await checkin(baseUrl, uid, jwtToken);
+
+    try {
+      await checkin(baseUrl, uid, jwtToken);
+    } catch (error) {
+      console.error("[jm] 签到失败:", error.message || error);
+    }
+
+    await runMakeup(baseUrl, uid, jwtToken);
     console.log("[jm] 每日签到任务完成");
   } catch (error) {
     console.error("[jm] 签到任务失败:", error.message || error);

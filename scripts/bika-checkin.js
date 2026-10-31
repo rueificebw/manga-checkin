@@ -24,7 +24,7 @@ function cleanPath(input) {
       const parsed = new URL(value);
       return `${parsed.pathname}${parsed.search}`.replace(/^\/+/, "");
     } catch {
-      // ignore
+      // 忽略解析错误
     }
   }
   return value
@@ -72,8 +72,7 @@ async function bikaRequest({ apiBase, method, url, body, authorization }) {
   const fullUrl = url.startsWith("http") ? url : `${apiBase}${url}`;
   const headers = buildHeaders({ method, url: fullUrl, authorization });
 
-  // 非 GET 请求一律携带 JSON 请求体（缺失时默认空对象 {}），
-  // 哔咔 punch-in 等接口必须发送空对象 {}，否则服务端返回 res.status:"fail"
+  // 非 GET 请求默认传空 JSON 对象
   const requestConfig = {
     method,
     url: fullUrl,
@@ -166,8 +165,6 @@ async function checkin(token) {
       apiBase,
       method: "POST",
       url: "users/punch-in",
-      // 哔咔 punch-in 接口必须携带空 JSON 对象 {} 请求体，
-      // 否则服务端返回 data.res.status:"fail"
       body: {},
       authorization: token,
     })
@@ -182,8 +179,7 @@ async function checkin(token) {
     return true;
   }
 
-  // status 为 "fail" 时可能是"今日已签到"（幂等），也可能是真实失败，
-  // 通过 users/profile 的 isPunched 字段二次确认
+  // 用 isPunched 确认是否已签到
   if (status === "fail") {
     const profile = await tryWithFallback((apiBase) =>
       bikaRequest({
@@ -200,15 +196,13 @@ async function checkin(token) {
     throw new Error(`签到失败: ${JSON.stringify(data)}`);
   }
 
-  // 兜底：兼容其他成功格式（"already" 等提示）
+  // 兼容其他成功提示
   const msg = data?.message || data?.errorMsg || "";
   if (msg.includes("already") || msg.includes("已签到") || msg.includes("已经")) {
     console.log("[bika] 今天已经签到过了");
     return true;
   }
 
-  // 注意：data.message 通常是 "success"（HTTP 层消息），不能作为失败原因，
-  // 因此直接输出完整响应便于排查
   throw new Error(`签到失败: ${JSON.stringify(data)}`);
 }
 
@@ -232,7 +226,7 @@ async function verifyCheckinStatus(token) {
     console.warn("[bika] 签到状态验证失败: 今日未签到 ✗");
     return false;
   }
-  // 部分 API 版本 profile 不返回 isPunched 字段，此时不阻塞任务
+  // 无 isPunched 字段时不阻塞
   console.warn("[bika] profile 未返回 isPunched 字段，跳过状态验证");
   return true;
 }
